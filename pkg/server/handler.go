@@ -33,6 +33,7 @@ import (
 
 	admin "github.com/alipay/sofa-mosn/pkg/admin/store"
 	v2 "github.com/alipay/sofa-mosn/pkg/api/v2"
+	mosnctx "github.com/alipay/sofa-mosn/pkg/context"
 	"github.com/alipay/sofa-mosn/pkg/filter/accept/originaldst"
 	"github.com/alipay/sofa-mosn/pkg/log"
 	"github.com/alipay/sofa-mosn/pkg/metrics"
@@ -132,14 +133,6 @@ func (ch *connHandler) AddOrUpdateListener(lc *v2.Listener, networkFiltersFactor
 		}
 		if streamFiltersFactories != nil {
 			al.streamFiltersFactories = streamFiltersFactories
-			// update live connection stream filter factory
-			log.DefaultLogger.Debugf("update live connection stream filter factory context")
-			al.connsMux.Lock()
-			for e := al.conns.Front(); e != nil; e = e.Next() {
-				conn := e.Value.(*activeConnection)
-				conn.ctx = context.WithValue(conn.ctx, types.ContextKeyStreamFilterChainFactories, al.streamFiltersFactories)
-			}
-			al.connsMux.Unlock()
 			rawConfig.StreamFilters = lc.StreamFilters
 		}
 
@@ -173,15 +166,6 @@ func (ch *connHandler) AddOrUpdateListener(lc *v2.Listener, networkFiltersFactor
 		// listener doesn't exist, add the listener
 		//TODO: connection level stop-chan usage confirm
 		listenerStopChan := make(chan struct{})
-		//use default listener path
-		if lc.LogPath == "" {
-			lc.LogPath = types.MosnLogBasePath + string(os.PathSeparator) + lc.Name + ".log"
-		}
-
-		logger, err := log.GetOrCreateDefaultErrorLogger(lc.LogPath, log.Level(lc.LogLevel))
-		if err != nil {
-			return nil, fmt.Errorf("initialize listener logger failed : %v", err.Error())
-		}
 
 		//initialize access log
 		var als []types.AccessLog
@@ -200,9 +184,10 @@ func (ch *connHandler) AddOrUpdateListener(lc *v2.Listener, networkFiltersFactor
 			}
 		}
 
-		l := network.NewListener(lc, logger)
+		l := network.NewListener(lc)
 
-		al, err = newActiveListener(l, lc, logger, als, networkFiltersFactories, streamFiltersFactories, ch, listenerStopChan)
+		var err error
+		al, err = newActiveListener(l, lc, als, networkFiltersFactories, streamFiltersFactories, ch, listenerStopChan)
 		if err != nil {
 			return al, err
 		}
@@ -356,7 +341,7 @@ type activeListener struct {
 	tlsMng                  types.TLSContextManager
 }
 
-func newActiveListener(listener types.Listener, lc *v2.Listener, logger log.ErrorLogger, accessLoggers []types.AccessLog,
+func newActiveListener(listener types.Listener, lc *v2.Listener, accessLoggers []types.AccessLog,
 	networkFiltersFactories []types.NetworkFilterChainFactory, streamFiltersFactories []types.StreamFilterChainFactory,
 	handler *connHandler, stopChan chan struct{}) (*activeListener, error) {
 	al := &activeListener{
@@ -367,7 +352,6 @@ func newActiveListener(listener types.Listener, lc *v2.Listener, logger log.Erro
 		conns:        list.New(),
 		handler:      handler,
 		stopChan:     stopChan,
-		logger:       logger,
 		accessLogs:   accessLoggers,
 		updatedLabel: false,
 	}
@@ -385,9 +369,9 @@ func newActiveListener(listener types.Listener, lc *v2.Listener, logger log.Erro
 	al.listenPort = listenPort
 	al.stats = newListenerStats(al.listener.Name())
 
-	mgr, err := mtls.NewTLSServerContextManager(lc, listener, logger)
+	mgr, err := mtls.NewTLSServerContextManager(lc, listener, log.DefaultLogger)
 	if err != nil {
-		logger.Errorf("create tls context manager failed, %v", err)
+		log.DefaultLogger.Errorf("create tls context manager failed, %v", err)
 		return nil, err
 	}
 	al.tlsMng = mgr
@@ -418,18 +402,15 @@ func (al *activeListener) OnAccept(rawc net.Conn, handOffRestoredDestinationConn
 	if handOffRestoredDestinationConnections {
 		arc.acceptedFilters = append(arc.acceptedFilters, originaldst.NewOriginalDst())
 		arc.handOffRestoredDestinationConnections = true
-		log.DefaultLogger.Infof("accept restored destination connection from:%s", al.listener.Addr().String())
-	} else {
-		log.DefaultLogger.Infof("accept connection from:%s", al.listener.Addr().String())
+		log.DefaultLogger.Debugf("[network][listener] accept restored destination connection from %s, remote addr:%s, origin remote addr:%s", al.listener.Addr().String(), rawc.RemoteAddr().String(), oriRemoteAddr.String())
 	}
 
-	ctx := context.WithValue(context.Background(), types.ContextKeyListenerPort, al.listenPort)
-	ctx = context.WithValue(ctx, types.ContextKeyListenerType, al.listener.Config().Type)
-	ctx = context.WithValue(ctx, types.ContextKeyListenerName, al.listener.Name())
-	ctx = context.WithValue(ctx, types.ContextKeyNetworkFilterChainFactories, al.networkFiltersFactories)
-	ctx = context.WithValue(ctx, types.ContextKeyStreamFilterChainFactories, al.streamFiltersFactories)
-	ctx = context.WithValue(ctx, types.ContextKeyLogger, al.logger)
-	ctx = context.WithValue(ctx, types.ContextKeyAccessLogs, al.accessLogs)
+	ctx := mosnctx.WithValue(context.Background(), types.ContextKeyListenerPort, al.listenPort)
+	ctx = mosnctx.WithValue(ctx, types.ContextKeyListenerType, al.listener.Config().Type)
+	ctx = mosnctx.WithValue(ctx, types.ContextKeyListenerName, al.listener.Name())
+	ctx = mosnctx.WithValue(ctx, types.ContextKeyNetworkFilterChainFactories, al.networkFiltersFactories)
+	ctx = mosnctx.WithValue(ctx, types.ContextKeyStreamFilterChainFactories, al.streamFiltersFactories)
+	ctx = mosnctx.WithValue(ctx, types.ContextKeyAccessLogs, al.accessLogs)
 	if rawf != nil {
 		ctx = context.WithValue(ctx, types.ContextKeyConnectionFd, rawf)
 	}
@@ -459,7 +440,6 @@ func (al *activeListener) OnNewConnection(ctx context.Context, conn types.Connec
 		return
 	}
 	ac := newActiveConnection(al, conn)
-	ac.ctx = ctx
 
 	al.connsMux.Lock()
 	e := al.conns.PushBack(ac)
@@ -468,7 +448,9 @@ func (al *activeListener) OnNewConnection(ctx context.Context, conn types.Connec
 
 	atomic.AddInt64(&al.handler.numConnections, 1)
 
-	al.logger.Debugf("new downstream connection %d accepted", conn.ID())
+	if log.DefaultLogger.GetLogLevel() >= log.DEBUG {
+		log.DefaultLogger.Debugf("[network][listener] accept connection from %s, condId= %d, remote addr:%s", al.listener.Addr().String(), conn.ID(), conn.RemoteAddr().String())
+	}
 
 	// todo: this hack is due to http2 protocol process. golang http2 provides a io loop to read/write stream
 	if !al.disableConnIo {
@@ -489,8 +471,8 @@ func (al *activeListener) removeConnection(ac *activeConnection) {
 }
 
 func (al *activeListener) newConnection(ctx context.Context, rawc net.Conn) {
-	conn := network.NewServerConnection(ctx, rawc, al.stopChan, al.logger)
-	oriRemoteAddr := ctx.Value(types.ContextOriRemoteAddr)
+	conn := network.NewServerConnection(ctx, rawc, al.stopChan)
+	oriRemoteAddr := mosnctx.Get(ctx, types.ContextOriRemoteAddr)
 	if oriRemoteAddr != nil {
 		conn.SetRemoteAddr(oriRemoteAddr.(net.Addr))
 	}
@@ -594,7 +576,6 @@ type activeConnection struct {
 	element  *list.Element
 	listener *activeListener
 	conn     types.Connection
-	ctx      context.Context
 }
 
 func newActiveConnection(listener *activeListener, conn types.Connection) *activeConnection {
